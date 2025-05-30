@@ -42,6 +42,7 @@ from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
 from torch import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
@@ -125,7 +126,7 @@ class nnUNetTrainer(object):
         self.output_folder_base = join(nnUNet_results, self.plans_manager.dataset_name,
                                        self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
             if nnUNet_results is not None else None
-        self.output_folder = join(self.output_folder_base, f'fold_{fold}')
+        self.output_folder = join(self.output_folder_base, f'fold_{fold}')      # TODO: Dont forget me!
 
         self.preprocessed_dataset_folder = join(self.preprocessed_dataset_folder_base,
                                                 self.configuration_manager.data_identifier)
@@ -144,11 +145,11 @@ class nnUNetTrainer(object):
         ### Some hyperparameters for you to fiddle with
         self.initial_lr = 1e-2
         self.weight_decay = 3e-5
-        self.oversample_foreground_percent = 0.33
+        self.oversample_foreground_percent = 0.5
         self.probabilistic_oversampling = False
-        self.num_iterations_per_epoch = 250
-        self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_iterations_per_epoch = 500
+        self.num_val_iterations_per_epoch = 100
+        self.num_epochs = 5000
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -162,6 +163,7 @@ class nnUNetTrainer(object):
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
+        self.weight_bd = 1
 
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
@@ -172,6 +174,7 @@ class nnUNetTrainer(object):
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
         self.logger = nnUNetLogger()
+        self.writer = SummaryWriter()
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -397,7 +400,7 @@ class nnUNetTrainer(object):
                                    dice_class=MemoryEfficientSoftDiceLoss)
         else:
             loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1, weight_bd=self.weight_bd,
                                   ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
 
         if self._do_i_compile():
@@ -989,6 +992,7 @@ class nnUNetTrainer(object):
             output = self.network(data)
             # del data
             l = self.loss(output, target)
+            print("Training Loss:", l)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1000,6 +1004,7 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
+
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1013,6 +1018,13 @@ class nnUNetTrainer(object):
             loss_here = np.mean(outputs['loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+
+        # Log loss and gradients to TensorBoard every 10 epochs
+        if self.current_epoch % 10 == 0:
+            self.writer.add_scalar('Loss/train_epoch', loss_here, self.current_epoch)
+            for name, param in self.network.named_parameters():
+                if param.grad is not None and ('decoder' in name or 'seg_layers' in name):
+                    self.writer.add_histogram(f'Gradients/{name}', param.grad, self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
@@ -1116,6 +1128,9 @@ class nnUNetTrainer(object):
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+
+        # Log loss and gradients to TensorBoard
+        self.writer.add_scalar('Loss/val', loss_here, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
