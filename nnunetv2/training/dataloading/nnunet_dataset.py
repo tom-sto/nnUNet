@@ -144,8 +144,11 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
         else:
             seg_prev = None
 
+        dist_map_file = join(self.source_folder, identifier + '_dist.b2nd')
+        dist_map = blosc2.open(urlpath=dist_map_file, mode='r', dparams=dparams, mmap_mode='r')
+
         properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
-        return data, seg, seg_prev, properties
+        return data, seg, seg_prev, dist_map, properties
 
     @staticmethod
     def save_case(

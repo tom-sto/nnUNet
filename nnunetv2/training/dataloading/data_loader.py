@@ -78,7 +78,7 @@ class nnUNetDataLoader(DataLoader):
 
     def determine_shapes(self):
         # load one case
-        data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
+        data, seg, seg_prev, _, properties = self._data.load_case(self._data.identifiers[0])
         num_color_channels = data.shape[0]
 
         data_shape = (self.batch_size, num_color_channels, *self.patch_size)
@@ -169,13 +169,14 @@ class nnUNetDataLoader(DataLoader):
         # preallocate memory for data and seg
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        dist_map_all = np.zeros(self.seg_shape, dtype=np.float32)
 
         for j, i in enumerate(selected_keys):
             # oversampling foreground will improve stability of model training, especially if many patches are empty
             # (Lung for example)
             force_fg = self.get_do_oversample(j)
 
-            data, seg, seg_prev, properties = self._data.load_case(i)
+            data, seg, seg_prev, dist_map, properties = self._data.load_case(i)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
             # self._data.load_case(i) (see nnUNetDataset.load_case)
@@ -192,6 +193,8 @@ class nnUNetDataLoader(DataLoader):
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
             seg_all[j] = seg_cropped
 
+            dist_map_all[j] = crop_and_pad_nd(dist_map, bbox, 0)      # Not sure if 999 will ever appear but you never know...
+
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
             seg_all = seg_all[:, :, 0]
@@ -201,21 +204,30 @@ class nnUNetDataLoader(DataLoader):
                 with threadpool_limits(limits=1, user_api=None):
                     data_all = torch.from_numpy(data_all).float()
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    dist_map_all = torch.from_numpy(dist_map_all).float()
                     images = []
                     segs = []
+                    dmps = []
                     for b in range(self.batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b], 'distmap': dist_map_all[b]})
                         images.append(tmp['image'])
                         segs.append(tmp['segmentation'])
+                        dmps.append(tmp['distmap'])
                     data_all = torch.stack(images)
                     if isinstance(segs[0], list):
                         seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
                     else:
                         seg_all = torch.stack(segs)
-                    del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+                    if isinstance(dmps[0], list):
+                        dist_map_all = [torch.stack([s[i] for s in dmps]) for i in range(len(dmps[0]))]
+                    else:
+                        dist_map_all = torch.stack(dmps)
+                        
+                    del segs, images, dmps
+            return {'data': data_all, 'target': seg_all, 'dist_map': dist_map_all, 'keys': selected_keys}
+
+        return {'data': data_all, 'target': seg_all, 'dist_map': dist_map_all, 'keys': selected_keys}
 
 
 if __name__ == '__main__':

@@ -30,7 +30,7 @@ from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResol
 from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
 from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
-from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform
+from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform, DownsampleDmapForDSTransform
 from batchgeneratorsv2.transforms.utils.nnunet_masking import MaskImageTransform
 from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, Convert2DTo3DTransform
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
@@ -104,6 +104,8 @@ class nnUNetTrainer(object):
                 # we might want to let the user pick this but for now please pick the correct GPU with CUDA_VISIBLE_DEVICES=X
                 self.device = torch.device(type='cuda', index=0)
             print(f"Using device: {self.device}")
+
+        empty_cache(self.device)
 
         # loading and saving this class for continuing from checkpoint should not happen based on pickling. This
         # would also pickle the network etc. Bad, bad. Instead we just reinstantiate and then load the checkpoint we
@@ -842,6 +844,7 @@ class nnUNetTrainer(object):
 
         if deep_supervision_scales is not None:
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
+            transforms.append(DownsampleDmapForDSTransform(ds_scales=deep_supervision_scales))
 
         return ComposeTransforms(transforms)
 
@@ -878,6 +881,7 @@ class nnUNetTrainer(object):
 
         if deep_supervision_scales is not None:
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
+            transforms.append(DownsampleDmapForDSTransform(ds_scales=deep_supervision_scales))
         return ComposeTransforms(transforms)
 
     def set_deep_supervision_enabled(self, enabled: bool):
@@ -964,6 +968,7 @@ class nnUNetTrainer(object):
         self.print_to_log_file("Training done.")
 
     def on_train_epoch_start(self):
+        self.update_weight_bd()
         self.network.train()
         self.lr_scheduler.step(self.current_epoch)
         self.print_to_log_file('')
@@ -976,12 +981,18 @@ class nnUNetTrainer(object):
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
+        dmap = batch['dist_map']
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
+
+        if isinstance(dmap, list):
+            dmap = [i.to(self.device, non_blocking=True) for i in dmap]
+        else:
+            dmap = dmap.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
@@ -991,7 +1002,7 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             # del data
-            l = self.loss(output, target)
+            l = self.loss(output, target, dmap)
             print("Training Loss:", l)
 
         if self.grad_scaler is not None:
@@ -1032,12 +1043,18 @@ class nnUNetTrainer(object):
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
+        dmap = batch['dist_map']
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
+
+        if isinstance(dmap, list):
+            dmap = [i.to(self.device, non_blocking=True) for i in dmap]
+        else:
+            dmap = dmap.to(self.device, non_blocking=True)
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
@@ -1046,7 +1063,7 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             del data
-            l = self.loss(output, target)
+            l = self.loss(output, target, dmap)
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1396,3 +1413,12 @@ class nnUNetTrainer(object):
             self.on_epoch_end()
 
         self.on_train_end()
+
+    def update_weight_bd(self):             # Custom schedule for bd loss weight
+        if self.current_epoch > min(self.num_epochs * 0.9, 2250):     
+            self.loss.weight_bd = 1000                                # go to 1000 after 90% of total or 2250 epochs
+        elif self.current_epoch > min(self.num_epochs * 0.5, 1250):     
+            self.loss.weight_bd = 100                                 # go to 100 after half of total or 1250 epochs
+        elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
+            self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
+        

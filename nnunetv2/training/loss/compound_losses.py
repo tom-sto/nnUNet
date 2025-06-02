@@ -3,7 +3,7 @@ from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLos
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
-from distmap import euclidean_signed_transform
+# from distmap import euclidean_signed_transform
 
 class BoundaryLoss(nn.Module):
     """
@@ -39,7 +39,7 @@ class BoundaryLoss(nn.Module):
         if reduction not in ['mean', 'sum', 'none']:
             raise ValueError(f"Reduction must be 'mean', 'sum', or 'none', but got {reduction}")
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, dist_maps: torch.Tensor) -> torch.Tensor:
         """
         Calculates the Boundary Loss.
 
@@ -47,9 +47,8 @@ class BoundaryLoss(nn.Module):
             inputs (torch.Tensor): Raw outputs from the model.
                                    Shape: (N, C, H, W, D) for 3D or (N, C, H, W) for 2D.
                                    Expect C = 2 for binary background vs foreground
-            targets (torch.Tensor): Ground truth segmentation masks.
+            dist_maps (torch.Tensor): Distance maps for ground truth segmentations.
                                     Shape: (N, C, H, W, D) or (N, C, H, W).
-                                    Expected to be one-hot encoded if C > 1, or binary if C=1.
 
         Returns:
             torch.Tensor: The calculated Boundary Loss.
@@ -60,20 +59,9 @@ class BoundaryLoss(nn.Module):
 
         inputs = inputs[:, self.class_idx:self.class_idx+1, ...]    # select foreground only
 
-        # Extract the foreground channel from targets
-        # Assuming targets are one-hot encoded (N, C, ...) and foreground is at self.class_idx
-        # Or if targets are binary (N, 1, ...)
-        if targets.shape[1] > 1:
-            # For multi-class or one-hot encoded binary, select the foreground class
-            targets = targets[:, self.class_idx:self.class_idx+1, ...]
-
-        sdm_batch = -euclidean_signed_transform(targets, ndim=3)
-        # replace any inf's with a large number
-        sdm_batch[sdm_batch == float('inf')] = 1000
-
         # Calculate the core Boundary Loss term
         # Element-wise product of predicted probabilities and SDM
-        loss: torch.Tensor = inputs * sdm_batch
+        loss: torch.Tensor = inputs * dist_maps
         # print("Boundary Loss has gradient:", loss.requires_grad)
 
         # Apply reduction
@@ -110,7 +98,7 @@ class DC_and_CE_loss(nn.Module):
         self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
         self.bd = BoundaryLoss()
 
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, dmap: torch.Tensor | None = None):
         """
         target must be b, c, x, y(, z) with c=1
         :param net_output:
@@ -129,12 +117,36 @@ class DC_and_CE_loss(nn.Module):
             target_dice = target
             mask = None
 
+        # if dmap is not None:
+        #     print("Looking at distance maps")
+        #     print(f"dmap size: {dmap.shape}")
+        #     print(f"target shape: {target.shape}")
+        #     print(f"Target contains foreground: {torch.any(target == 1)}")
+        #     edt: torch.Tensor = -euclidean_signed_transform(target, ndim=3)
+        #     print(f"Are all points inf? {torch.sum(edt == float('inf'))} / {torch.numel(edt)}")
+        #     print("Target:", torch.unique(target))
+        #     print("dmap:", torch.unique(dmap))
+        #     print("edt:", torch.unique(edt))
+        #     t_dmap = target * dmap
+        #     print(torch.unique(t_dmap))
+        #     inv = (1 - target) * dmap
+        #     print(torch.unique(inv))
+        #     edt = torch.where(edt == float('inf'), 1000, edt)
+            
+        #     areSame = torch.count_nonzero(dmap == edt)
+        #     diff = edt - dmap
+        #     print(f"Are same: {areSame} / {torch.numel(edt)}\tDiff: {diff.min()}, {diff.mean()}, {diff.max()}")
+            
+        # else:
+        #     print("No distance maps :(")
+
         dc_loss = self.dc(net_output, target_dice, loss_mask=mask) \
             if self.weight_dice != 0 else 0
         ce_loss = self.ce(net_output, target[:, 0]) \
             if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
-        bd_loss = self.bd(net_output, target_dice) \
-            if self.weight_bd != 0 else 0
+        bd_loss = self.bd(net_output, dmap) \
+            if self.weight_bd != 0 and dmap is not None else 0
+        
         
         print("Dice loss:", dc_loss, "\tCE loss:", ce_loss, "\tBD loss:", bd_loss)
 
