@@ -128,7 +128,9 @@ class nnUNetTrainer(object):
         self.output_folder_base = join(nnUNet_results, self.plans_manager.dataset_name,
                                        self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
             if nnUNet_results is not None else None
-        self.output_folder = join(self.output_folder_base, f'fold_{fold}')      # TODO: Dont forget me!
+        self.output_folder = join(self.output_folder_base, f'fold_{fold}_transformer')      # TODO: Dont forget me!
+        self.metadata_folder = join(nnUNet_preprocessed, '..', 'patient_info_files')
+        assert os.path.exists(self.metadata_folder), f"{self.metadata_folder} does not exist."
 
         self.preprocessed_dataset_folder = join(self.preprocessed_dataset_folder_base,
                                                 self.configuration_manager.data_identifier)
@@ -970,7 +972,6 @@ class nnUNetTrainer(object):
     def on_train_epoch_start(self):
         self.update_weight_bd()
         self.network.train()
-        self.lr_scheduler.step(self.current_epoch)
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
@@ -982,6 +983,9 @@ class nnUNetTrainer(object):
         data = batch['data']
         target = batch['target']
         dmap = batch['dist_map']
+        keys = batch['keys']
+
+        metadata = self.get_metadata(keys)
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1000,7 +1004,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
+            output = self.network(data, metadata)
             # del data
             l = self.loss(output, target, dmap)
             print("Training Loss:", l)
@@ -1019,6 +1023,7 @@ class nnUNetTrainer(object):
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
+        self.lr_scheduler.step(self.current_epoch)
         outputs = collate_outputs(train_outputs)
 
         if self.is_ddp:
@@ -1044,6 +1049,9 @@ class nnUNetTrainer(object):
         data = batch['data']
         target = batch['target']
         dmap = batch['dist_map']
+        keys = batch['keys']
+
+        metadata = self.get_metadata(keys)
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1061,7 +1069,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
+            output = self.network(data, metadata)
             del data
             l = self.loss(output, target, dmap)
 
@@ -1422,3 +1430,14 @@ class nnUNetTrainer(object):
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
         
+    def get_metadata(self, keys: list) -> list:
+        metadata = []
+        for patient_id in keys:
+            json = load_json(join(self.metadata_folder, f"{patient_id}.json"))
+            if json is None:
+                raise RuntimeError(f"Metadata for patient {patient_id} not found in {self.metadata_folder}. "
+                                   f"Did you run the preprocessing?")
+            useful_json = json["clinical_data"]
+
+            metadata.append(useful_json)
+        return metadata
