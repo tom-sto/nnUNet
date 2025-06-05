@@ -70,7 +70,8 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'),
+                 tag: str = ""):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -126,7 +127,7 @@ class nnUNetTrainer(object):
         self.output_folder_base = join(nnUNet_results, self.plans_manager.dataset_name,
                                        self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
             if nnUNet_results is not None else None
-        self.output_folder = join(self.output_folder_base, f'fold_{fold}_transformer')      # TODO: Dont forget me!
+        self.output_folder = join(self.output_folder_base, f'fold_{fold}{tag}')      # TODO: Dont forget me!
         self.metadata_folder = join(nnUNet_preprocessed, '..', 'patient_info_files')
         assert os.path.exists(self.metadata_folder), f"{self.metadata_folder} does not exist."
 
@@ -977,7 +978,6 @@ class nnUNetTrainer(object):
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
-        dmap = batch['dist_map']
         keys = batch['keys']
 
         metadata = self.get_metadata(keys)
@@ -1038,7 +1038,6 @@ class nnUNetTrainer(object):
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
-        dmap = batch['dist_map']
         keys = batch['keys']
 
         metadata = self.get_metadata(keys)

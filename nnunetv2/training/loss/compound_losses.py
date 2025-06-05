@@ -67,9 +67,14 @@ class BoundaryLoss(nn.Module):
             # For multi-class or one-hot encoded binary, select the foreground class
             targets = targets[:, self.class_idx:self.class_idx+1, ...]
 
-        sdm_batch = -euclidean_signed_transform(targets, ndim=3)
-        # replace any inf's with a large number
-        sdm_batch[sdm_batch == float('inf')] = 1000
+        large_value = 1000
+        is_all_zero = torch.all(targets == 0, dim=(-1, -2, -3))
+        mask = is_all_zero.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        calc_distmap = lambda t: -euclidean_signed_transform(t, ndim=3)
+        # # not sure we need this since running this on exclusively non-zero-only should guarantee no infs
+        # fix_distmap = lambda t: torch.where(t == float('inf'), large_value, t)
+        sdm_batch = torch.where(mask, torch.ones_like(targets) * large_value,
+                               calc_distmap(targets))
 
         # Calculate the core Boundary Loss term
         # Element-wise product of predicted probabilities and SDM
