@@ -70,7 +70,7 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'), tag: str = ""):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -128,7 +128,7 @@ class nnUNetTrainer(object):
         self.output_folder_base = join(nnUNet_results, self.plans_manager.dataset_name,
                                        self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
             if nnUNet_results is not None else None
-        self.output_folder = join(self.output_folder_base, f'fold_{fold}_transformer')      # TODO: Dont forget me!
+        self.output_folder = join(self.output_folder_base, f'fold_{fold}{tag}')      # TODO: Dont forget me!
         self.metadata_folder = join(nnUNet_preprocessed, '..', 'patient_info_files')
         assert os.path.exists(self.metadata_folder), f"{self.metadata_folder} does not exist."
 
@@ -971,6 +971,7 @@ class nnUNetTrainer(object):
 
     def on_train_epoch_start(self):
         self.update_weight_bd()
+        self.lr_scheduler.step(self.current_epoch)
         self.network.train()
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
@@ -1023,7 +1024,6 @@ class nnUNetTrainer(object):
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
-        self.lr_scheduler.step(self.current_epoch)
         outputs = collate_outputs(train_outputs)
 
         if self.is_ddp:
