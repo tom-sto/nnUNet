@@ -978,9 +978,9 @@ class nnUNetTrainer(object):
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
-        keys = batch['keys']
+        # keys = batch['keys']
 
-        metadata = self.get_metadata(keys)
+        # metadata = self.get_metadata(keys)
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -994,7 +994,10 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data, metadata)
+            output = self.network(data)
+            # print("Targets:", len(target), target[0].shape)
+            # print("Data:", len(data), data[0].shape)
+            # print("Outputs:", output.shape)
             # del data
             l = self.loss(output, target)
             print("Training Loss:", l)
@@ -1038,9 +1041,9 @@ class nnUNetTrainer(object):
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
-        keys = batch['keys']
+        # keys = batch['keys']
 
-        metadata = self.get_metadata(keys)
+        # metadata = self.get_metadata(keys)
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1053,7 +1056,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data, metadata)
+            output = self.network(data)
             del data
             l = self.loss(output, target)
 
