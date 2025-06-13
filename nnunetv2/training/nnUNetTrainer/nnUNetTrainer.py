@@ -624,7 +624,7 @@ class nnUNetTrainer(object):
                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
         dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
                                          folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-        return dataset_tr, dataset_val
+        return dataset_tr, dataset_val, tr_keys, val_keys
 
     def get_dataloaders(self):
         if self.dataset_class is None:
@@ -661,21 +661,41 @@ class nnUNetTrainer(object):
                                                         self.label_manager.has_regions else None,
                                                         ignore_label=self.label_manager.ignore_label)
 
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+        dataset_tr, dataset_val, tr_keys, val_keys = self.get_tr_and_val_datasets()
+
+        tr_keys = np.array(tr_keys)
+        val_keys = np.array(val_keys)
+
+        tr_start = {"duke": 0.25, "ispy1": 0.25, "ispy2": 0.25, "nact": 0.25}
+        tr_probs = np.zeros_like(tr_keys, dtype=np.float32)
+        for group, prob in tr_start.items():
+            mask = np.char.find(tr_keys, group) != -1
+            count = np.sum(mask)
+            if count > 0:
+                tr_probs[mask] = prob / count
+
+
+        val_start = {"duke": 0.25, "ispy1": 0.25, "ispy2": 0.25, "nact": 0.25}
+        val_probs = np.zeros_like(val_keys, dtype=np.float32)
+        for group, prob in val_start.items():
+            mask = np.char.find(val_keys, group) != -1
+            count = np.sum(mask)
+            if count > 0:
+                val_probs[mask] = prob / count
 
         dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
                                  initial_patch_size,
                                  self.configuration_manager.patch_size,
                                  self.label_manager,
                                  oversample_foreground_percent=self.oversample_foreground_percent,
-                                 sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+                                 sampling_probabilities=tr_probs, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
         dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
                                   oversample_foreground_percent=self.oversample_foreground_percent,
-                                  sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+                                  sampling_probabilities=val_probs, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
         allowed_num_processes = get_allowed_n_proc_DA()
