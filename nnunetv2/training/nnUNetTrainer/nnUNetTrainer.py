@@ -29,6 +29,7 @@ from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransfo
 from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResolutionTransform
 from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
 from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
+from batchgeneratorsv2.transforms.spatial.transpose import TransposeAxesTransform
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
 from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform, DownsampleDmapForDSTransform
 from batchgeneratorsv2.transforms.utils.nnunet_masking import MaskImageTransform
@@ -70,7 +71,8 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
-                 device: torch.device = torch.device('cuda'), tag: str = ""):
+                 device: torch.device = torch.device('cuda'),
+                 tag: str = ""):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -625,7 +627,7 @@ class nnUNetTrainer(object):
                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
         dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
                                          folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-        return dataset_tr, dataset_val
+        return dataset_tr, dataset_val, tr_keys, val_keys
 
     def get_dataloaders(self):
         if self.dataset_class is None:
@@ -662,21 +664,41 @@ class nnUNetTrainer(object):
                                                         self.label_manager.has_regions else None,
                                                         ignore_label=self.label_manager.ignore_label)
 
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+        dataset_tr, dataset_val, tr_keys, val_keys = self.get_tr_and_val_datasets()
+
+        tr_keys = np.array(tr_keys)
+        val_keys = np.array(val_keys)
+
+        tr_start = {"duke": 0.25, "ispy1": 0.25, "ispy2": 0.25, "nact": 0.25}
+        tr_probs = np.zeros_like(tr_keys, dtype=np.float32)
+        for group, prob in tr_start.items():
+            mask = np.char.find(tr_keys, group) != -1
+            count = np.sum(mask)
+            if count > 0:
+                tr_probs[mask] = prob / count
+
+
+        val_start = {"duke": 0.25, "ispy1": 0.25, "ispy2": 0.25, "nact": 0.25}
+        val_probs = np.zeros_like(val_keys, dtype=np.float32)
+        for group, prob in val_start.items():
+            mask = np.char.find(val_keys, group) != -1
+            count = np.sum(mask)
+            if count > 0:
+                val_probs[mask] = prob / count
 
         dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
                                  initial_patch_size,
                                  self.configuration_manager.patch_size,
                                  self.label_manager,
                                  oversample_foreground_percent=self.oversample_foreground_percent,
-                                 sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+                                 sampling_probabilities=tr_probs, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
         dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
                                   oversample_foreground_percent=self.oversample_foreground_percent,
-                                  sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+                                  sampling_probabilities=val_probs, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
         allowed_num_processes = get_allowed_n_proc_DA()
@@ -719,11 +741,15 @@ class nnUNetTrainer(object):
         else:
             patch_size_spatial = patch_size
             ignore_axes = None
+        transforms.append(RandomTransform(
+            TransposeAxesTransform(allowed_axes=(0, 1, 2)),
+            apply_probability=0.0
+        ))
         transforms.append(
             SpatialTransform(
                 patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
-                p_rotation=0.2,
-                rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
+                p_rotation=0.5,
+                rotation=rotation_for_DA, p_scaling=0.5, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
                 bg_style_seg_sampling=False  # , mode_seg='nearest'
             )
         )
@@ -863,6 +889,11 @@ class nnUNetTrainer(object):
             RemoveLabelTansform(-1, 0)
         )
 
+        transforms.append(RandomTransform(
+            TransposeAxesTransform(allowed_axes=(0, 1, 2)),
+            apply_probability=0.0
+        ))
+
         if is_cascaded:
             transforms.append(
                 MoveSegAsOneHotToDataTransform(
@@ -970,7 +1001,7 @@ class nnUNetTrainer(object):
         self.print_to_log_file("Training done.")
 
     def on_train_epoch_start(self):
-        self.update_weight_bd()
+        self.update_loss_weights()
         self.lr_scheduler.step(self.current_epoch)
         self.network.train()
         self.print_to_log_file('')
@@ -1024,6 +1055,7 @@ class nnUNetTrainer(object):
         return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
+        self.lr_scheduler.step(self.current_epoch)
         outputs = collate_outputs(train_outputs)
 
         if self.is_ddp:
@@ -1248,7 +1280,8 @@ class nnUNetTrainer(object):
         if self.grad_scaler is not None:
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
-
+        return new_state_dict
+    
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
         self.network.eval()
@@ -1422,11 +1455,12 @@ class nnUNetTrainer(object):
 
         self.on_train_end()
 
-    def update_weight_bd(self):             # Custom schedule for bd loss weight
-        if self.current_epoch > min(self.num_epochs * 0.9, 2250):     
-            self.loss.weight_bd = 1000                                # go to 1000 after 90% of total or 2250 epochs
+    def update_loss_weights(self):             # Custom schedule for bd loss weight
+        if self.current_epoch > min(self.num_epochs * 0.8, 2250):     
+            self.loss.weight_bd = 10                                # go back down to 10 after 80% of total or 2250 epochs
         elif self.current_epoch > min(self.num_epochs * 0.5, 1250):     
             self.loss.weight_bd = 100                                 # go to 100 after half of total or 1250 epochs
+            self.loss.weight_dice = 1.5                               # also make Dice weight 50% higher 
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
         
