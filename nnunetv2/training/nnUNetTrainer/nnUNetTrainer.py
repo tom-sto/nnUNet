@@ -11,6 +11,7 @@ from typing import Tuple, Union, List
 
 import numpy as np
 import torch
+import pandas as pd
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
@@ -170,6 +171,10 @@ class nnUNetTrainer(object):
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
         self.weight_bd = 1
+        self.cls_loss_weight = 0.5
+        self.cls_loss = None
+        self.df_path = rf"{os.environ["MAMAMIA_DATA"]}/clinical_and_imaging_info.xlsx"
+        self.pcr_df = None
 
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
@@ -207,6 +212,7 @@ class nnUNetTrainer(object):
                                also_print_to_console=True, add_timestamp=False)
 
     def initialize(self):
+        self.pcr_df = pd.read_excel(self.df_path, sheet_name='dataset_info')
         if not self.was_initialized:
             ## DDP batch size and oversampling can differ between workers and needs adaptation
             # we need to change the batch size in DDP because we don't use any of those distributed samplers
@@ -669,18 +675,17 @@ class nnUNetTrainer(object):
         tr_keys = np.array(tr_keys)
         val_keys = np.array(val_keys)
 
-        tr_start = {"duke": 0.25, "ispy1": 0.25, "ispy2": 0.25, "nact": 0.25}
+        dist = {"duke": 0.25, "ispy1": 0.15, "ispy2": 0.5, "nact": 0.1}
         tr_probs = np.zeros_like(tr_keys, dtype=np.float32)
-        for group, prob in tr_start.items():
+        for group, prob in dist.items():
             mask = np.char.find(tr_keys, group) != -1
             count = np.sum(mask)
             if count > 0:
                 tr_probs[mask] = prob / count
 
 
-        val_start = {"duke": 0.25, "ispy1": 0.25, "ispy2": 0.25, "nact": 0.25}
         val_probs = np.zeros_like(val_keys, dtype=np.float32)
-        for group, prob in val_start.items():
+        for group, prob in dist.items():
             mask = np.char.find(val_keys, group) != -1
             count = np.sum(mask)
             if count > 0:
@@ -1018,6 +1023,7 @@ class nnUNetTrainer(object):
         keys = batch['keys']
 
         metadata = self.get_metadata(keys)
+        pcrLabels = self.get_pcr(keys, df=self.pcr_df)
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1036,9 +1042,12 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data, metadata)
+            output, cls_out = self.network(data, metadata)
             # del data
             l = self.loss(output, target, dmap)
+            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
+            print("cls_loss:", cls_loss.item())
+            l += cls_loss
             print("Training Loss:", l)
 
         if self.grad_scaler is not None:
@@ -1084,6 +1093,7 @@ class nnUNetTrainer(object):
         keys = batch['keys']
 
         metadata = self.get_metadata(keys)
+        pcrLabels = self.get_pcr(keys, df=self.pcr_df)
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1101,9 +1111,12 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data, metadata)
+            output, cls_out = self.network(data, metadata)
             del data
             l = self.loss(output, target, dmap)
+            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
+            print("cls_loss:", cls_loss.item())
+            l += cls_loss
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1151,7 +1164,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1475,3 +1488,24 @@ class nnUNetTrainer(object):
 
             metadata.append(useful_json)
         return metadata
+
+    def get_pcr(self, keys: list[str], df: pd.DataFrame) -> list:
+        """
+        Get the PCR labels for the given keys.
+        :param keys: List of patient identifiers.
+        :return: List of PCR labels.
+        """
+        if df is None:
+            raise ValueError("PCR DataFrame is not provided. Please ensure that the DataFrame is loaded correctly.")
+        pcr_labels = []
+        for patient_id in keys:
+            patient_id = patient_id.upper()
+            if patient_id in df['patient_id'].values:
+                pcr_label = df.loc[df['patient_id'] == patient_id, 'pcr'].values[0]
+                if np.isnan(pcr_label):
+                    pcr_label = -1
+                pcr_labels.append(pcr_label)
+            else:
+                raise ValueError(f"Patient ID {patient_id} not found in the DataFrame. Please check the input keys.")
+
+        return pcr_labels
