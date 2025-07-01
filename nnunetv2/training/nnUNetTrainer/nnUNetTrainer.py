@@ -171,8 +171,8 @@ class nnUNetTrainer(object):
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
         self.weight_bd = 1
-        self.cls_loss_weight = 0.01
         self.cls_loss = None
+        self.cls_loss_weight = 0.01
         self.df_path = rf"{os.environ["MAMAMIA_DATA"]}/clinical_and_imaging_info.xlsx"
         self.pcr_df = None
 
@@ -748,11 +748,11 @@ class nnUNetTrainer(object):
             ignore_axes = None
         transforms.append(RandomTransform(
             TransposeAxesTransform(allowed_axes=(0, 1, 2)),
-            apply_probability=0.0
+            apply_probability=0.2
         ))
         transforms.append(
             SpatialTransform(
-                patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
+                patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0.2,
                 p_rotation=0.5,
                 rotation=rotation_for_DA, p_scaling=0.5, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
                 bg_style_seg_sampling=False  # , mode_seg='nearest'
@@ -767,7 +767,7 @@ class nnUNetTrainer(object):
                 noise_variance=(0, 0.1),
                 p_per_channel=1,
                 synchronize_channels=True
-            ), apply_probability=0.1
+            ), apply_probability=0.2
         ))
         transforms.append(RandomTransform(
             GaussianBlurTransform(
@@ -782,7 +782,7 @@ class nnUNetTrainer(object):
                 multiplier_range=BGContrast((0.75, 1.25)),
                 synchronize_channels=False,
                 p_per_channel=1
-            ), apply_probability=0.15
+            ), apply_probability=0.2
         ))
         transforms.append(RandomTransform(
             ContrastTransform(
@@ -790,7 +790,7 @@ class nnUNetTrainer(object):
                 preserve_range=True,
                 synchronize_channels=False,
                 p_per_channel=1
-            ), apply_probability=0.15
+            ), apply_probability=0.2
         ))
         transforms.append(RandomTransform(
             SimulateLowResolutionTransform(
@@ -809,7 +809,7 @@ class nnUNetTrainer(object):
                 synchronize_channels=False,
                 p_per_channel=1,
                 p_retain_stats=1
-            ), apply_probability=0.1
+            ), apply_probability=0.2
         ))
         transforms.append(RandomTransform(
             GammaTransform(
@@ -1025,6 +1025,10 @@ class nnUNetTrainer(object):
         metadata = self.get_metadata(keys)
         pcrLabels = self.get_pcr(keys, df=self.pcr_df)
 
+        # remove -1 labels
+        labelMask = pcrLabels != -1
+        pcrLabels = pcrLabels[labelMask]
+
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1045,8 +1049,10 @@ class nnUNetTrainer(object):
             output, cls_out = self.network(data, metadata)
             # del data
             l = self.loss(output, target, dmap)
+
+            cls_out = cls_out.squeeze()[labelMask]
             cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
-            print("cls_loss:", cls_loss.item())
+            print("cls_loss:", cls_loss)
             l += cls_loss
             print("Training Loss:", l)
 
@@ -1095,6 +1101,10 @@ class nnUNetTrainer(object):
         metadata = self.get_metadata(keys)
         pcrLabels = self.get_pcr(keys, df=self.pcr_df)
 
+        # remove -1 labels
+        labelMask = pcrLabels != -1
+        pcrLabels = pcrLabels[labelMask]
+
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1114,8 +1124,12 @@ class nnUNetTrainer(object):
             output, cls_out = self.network(data, metadata)
             del data
             l = self.loss(output, target, dmap)
+            cls_out = cls_out.squeeze()[labelMask]
             cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
-            print("cls_loss:", cls_loss.item())
+            print("cls_loss:", cls_loss)
+
+            percentage_correct = ((torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels).float().mean()
+            print("Percentage correct PCR:", percentage_correct.item())
             l += cls_loss
 
         # we only need the output with the highest output resolution (if DS enabled)
@@ -1164,7 +1178,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1474,10 +1488,9 @@ class nnUNetTrainer(object):
         elif self.current_epoch > min(self.num_epochs * 0.5, 1250):     
             self.loss.weight_bd = 100                                 # go to 100 after half of total or 1250 epochs
             self.loss.weight_dice = 1.5                               # also make Dice weight 50% higher 
-            self.cls_loss_weight = 1                                  # and cls loss goes up to 1
+            self.cls_loss_weight = 0.05
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
-            self.cls_loss_weight = 0.1                                  # and cls loss goes up to 0.1
         
     def get_metadata(self, keys: list) -> list:
         metadata = []
@@ -1491,7 +1504,7 @@ class nnUNetTrainer(object):
             metadata.append(useful_json)
         return metadata
 
-    def get_pcr(self, keys: list[str], df: pd.DataFrame) -> list:
+    def get_pcr(self, keys: list[str], df: pd.DataFrame) -> torch.Tensor:
         """
         Get the PCR labels for the given keys.
         :param keys: List of patient identifiers.
@@ -1510,4 +1523,4 @@ class nnUNetTrainer(object):
             else:
                 raise ValueError(f"Patient ID {patient_id} not found in the DataFrame. Please check the input keys.")
 
-        return pcr_labels
+        return torch.tensor(pcr_labels, device=self.device)
