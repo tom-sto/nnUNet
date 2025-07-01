@@ -171,7 +171,7 @@ class nnUNetTrainer(object):
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
         self.weight_bd = 1
-        self.cls_loss_weight = 0.5
+        self.cls_loss_weight = 0.01
         self.cls_loss = None
         self.df_path = rf"{os.environ["MAMAMIA_DATA"]}/clinical_and_imaging_info.xlsx"
         self.pcr_df = None
@@ -1474,8 +1474,10 @@ class nnUNetTrainer(object):
         elif self.current_epoch > min(self.num_epochs * 0.5, 1250):     
             self.loss.weight_bd = 100                                 # go to 100 after half of total or 1250 epochs
             self.loss.weight_dice = 1.5                               # also make Dice weight 50% higher 
+            self.cls_loss_weight = 1                                  # and cls loss goes up to 1
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
+            self.cls_loss_weight = 0.1                                  # and cls loss goes up to 0.1
         
     def get_metadata(self, keys: list) -> list:
         metadata = []
