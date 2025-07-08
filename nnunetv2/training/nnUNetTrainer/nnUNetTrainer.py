@@ -30,7 +30,6 @@ from batchgeneratorsv2.transforms.noise.gaussian_blur import GaussianBlurTransfo
 from batchgeneratorsv2.transforms.spatial.low_resolution import SimulateLowResolutionTransform
 from batchgeneratorsv2.transforms.spatial.mirroring import MirrorTransform
 from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
-from batchgeneratorsv2.transforms.spatial.transpose import TransposeAxesTransform
 from batchgeneratorsv2.transforms.utils.compose import ComposeTransforms
 from batchgeneratorsv2.transforms.utils.deep_supervision_downsampling import DownsampleSegForDSTransform, DownsampleDmapForDSTransform
 from batchgeneratorsv2.transforms.utils.nnunet_masking import MaskImageTransform
@@ -69,6 +68,7 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
+from torchjd import mtl_backward
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -168,11 +168,12 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
+        self.aggregator = None  # -> self.initialize
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
         self.weight_bd = 1
         self.cls_loss = None
-        self.cls_loss_weight = 0.01
+        self.cls_loss_weight = 0.1
         self.df_path = rf"{os.environ["MAMAMIA_DATA"]}/clinical_and_imaging_info.xlsx"
         self.pcr_df = None
 
@@ -746,10 +747,10 @@ class nnUNetTrainer(object):
         else:
             patch_size_spatial = patch_size
             ignore_axes = None
-        transforms.append(RandomTransform(
-            TransposeAxesTransform(allowed_axes=(0, 1, 2)),
-            apply_probability=0.2
-        ))
+        # transforms.append(RandomTransform(
+        #     TransposeAxesTransform(allowed_axes=(0, 1, 2)),
+        #     apply_probability=0.2
+        # ))
         transforms.append(
             SpatialTransform(
                 patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0.2,
@@ -894,10 +895,10 @@ class nnUNetTrainer(object):
             RemoveLabelTansform(-1, 0)
         )
 
-        transforms.append(RandomTransform(
-            TransposeAxesTransform(allowed_axes=(0, 1, 2)),
-            apply_probability=0.0
-        ))
+        # transforms.append(RandomTransform(
+        #     TransposeAxesTransform(allowed_axes=(0, 1, 2)),
+        #     apply_probability=0.0
+        # ))
 
         if is_cascaded:
             transforms.append(
@@ -1046,28 +1047,33 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output, cls_out = self.network(data, metadata)
+            features, seg_out, cls_out = self.network(data, metadata)
             # del data
-            l = self.loss(output, target, dmap)
+            seg_loss = self.loss(seg_out, target, dmap)
 
             cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
+            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight \
+                if self.cls_loss is not None \
+                else torch.tensor(0.0, device=self.device)
             print("cls_loss:", cls_loss)
-            l += cls_loss
-            print("Training Loss:", l)
+            print("Training Loss:", seg_loss)
 
         if self.grad_scaler is not None:
-            self.grad_scaler.scale(l).backward()
+            mtl_backward(losses=self.grad_scaler.scale([seg_loss, cls_loss]), 
+                         features=features, 
+                         aggregator=self.aggregator,
+                         tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
+                         shared_params=list(self.network.encoder.parameters()))
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
-            l.backward()
+            mtl_backward(losses=[seg_loss, cls_loss], features=features, aggregator=self.aggregator)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        return {'loss': l.detach().cpu().numpy()}
+        return {'loss': seg_loss.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         self.lr_scheduler.step(self.current_epoch)
@@ -1121,16 +1127,16 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output, cls_out = self.network(data, metadata)
+            _, output, cls_out = self.network(data, metadata)
             del data
-            l = self.loss(output, target, dmap)
+            seg_loss = self.loss(output, target, dmap)
             cls_out = cls_out.squeeze()[labelMask]
             cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
             print("cls_loss:", cls_loss)
 
-            percentage_correct = ((torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels).float().mean()
+            percentage_correct: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels
+            percentage_correct = percentage_correct.float().mean()
             print("Percentage correct PCR:", percentage_correct.item())
-            l += cls_loss
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1178,7 +1184,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
+        return {'loss': seg_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1488,7 +1494,7 @@ class nnUNetTrainer(object):
         elif self.current_epoch > min(self.num_epochs * 0.5, 1250):     
             self.loss.weight_bd = 100                                 # go to 100 after half of total or 1250 epochs
             self.loss.weight_dice = 1.5                               # also make Dice weight 50% higher 
-            self.cls_loss_weight = 0.05
+            self.cls_loss_weight = 0.2
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
         
