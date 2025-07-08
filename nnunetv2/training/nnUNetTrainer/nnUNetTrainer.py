@@ -68,8 +68,6 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
-from torchjd import mtl_backward
-
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda'),
@@ -1019,8 +1017,6 @@ class nnUNetTrainer(object):
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
-        dmap = batch['dist_map']
         keys = batch['keys']
 
         metadata = self.get_metadata(keys)
@@ -1031,15 +1027,6 @@ class nnUNetTrainer(object):
         pcrLabels = pcrLabels[labelMask]
 
         data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        if isinstance(dmap, list):
-            dmap = [i.to(self.device, non_blocking=True) for i in dmap]
-        else:
-            dmap = dmap.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
@@ -1047,33 +1034,27 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            features, seg_out, cls_out = self.network(data, metadata)
+            cls_out = self.network(data, metadata)
             # del data
-            seg_loss = self.loss(seg_out, target, dmap)
 
             cls_out = cls_out.squeeze()[labelMask]
             cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight \
                 if self.cls_loss is not None \
                 else torch.tensor(0.0, device=self.device)
             print("cls_loss:", cls_loss)
-            print("Training Loss:", seg_loss)
 
         if self.grad_scaler is not None:
-            mtl_backward(losses=self.grad_scaler.scale([seg_loss, cls_loss]), 
-                         features=features, 
-                         aggregator=self.aggregator,
-                         tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
-                         shared_params=list(self.network.encoder.parameters()))
+            self.grad_scaler.scale(cls_loss)
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
-            mtl_backward(losses=[seg_loss, cls_loss], features=features, aggregator=self.aggregator)
+            cls_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
-        return {'loss': seg_loss.detach().cpu().numpy()}
+        return {'loss': cls_loss.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         self.lr_scheduler.step(self.current_epoch)
@@ -1101,7 +1082,6 @@ class nnUNetTrainer(object):
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
-        dmap = batch['dist_map']
         keys = batch['keys']
 
         metadata = self.get_metadata(keys)
@@ -1112,26 +1092,18 @@ class nnUNetTrainer(object):
         pcrLabels = pcrLabels[labelMask]
 
         data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        if isinstance(dmap, list):
-            dmap = [i.to(self.device, non_blocking=True) for i in dmap]
-        else:
-            dmap = dmap.to(self.device, non_blocking=True)
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            _, output, cls_out = self.network(data, metadata)
+            cls_out = self.network(data, metadata)
+            output = torch.zeros_like(data).to(self.device)
             del data
-            seg_loss = self.loss(output, target, dmap)
+
             cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
+            cls_loss = self.loss(cls_out, pcrLabels)
             print("cls_loss:", cls_loss)
 
             percentage_correct: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels
@@ -1139,6 +1111,7 @@ class nnUNetTrainer(object):
             print("Percentage correct PCR:", percentage_correct.item())
 
         # we only need the output with the highest output resolution (if DS enabled)
+        
         if self.enable_deep_supervision:
             output = output[0]
             target = target[0]
@@ -1184,7 +1157,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': seg_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
+        return {'loss': cls_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
