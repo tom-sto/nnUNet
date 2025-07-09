@@ -1090,6 +1090,10 @@ class nnUNetTrainer(object):
         pcrLabels = pcrLabels[labelMask]
 
         data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [i.to(self.device, non_blocking=True) for i in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
