@@ -1038,9 +1038,7 @@ class nnUNetTrainer(object):
             # del data
 
             cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight \
-                if self.cls_loss is not None \
-                else torch.tensor(0.0, device=self.device)
+            cls_loss = self.loss(cls_out, pcrLabels)
             print("cls_loss:", cls_loss)
 
         if self.grad_scaler is not None:

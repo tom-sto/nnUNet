@@ -193,7 +193,8 @@ class nnUNetDataLoader(DataLoader):
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
             seg_all[j] = seg_cropped
 
-            dist_map_all[j] = crop_and_pad_nd(dist_map, bbox, 0)      # Not sure if 999 will ever appear but you never know...
+            if dist_map is not None:
+                dist_map_all[j] = crop_and_pad_nd(dist_map, bbox, 0)
 
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]

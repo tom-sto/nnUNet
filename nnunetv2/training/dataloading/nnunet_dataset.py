@@ -145,7 +145,10 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
             seg_prev = None
 
         dist_map_file = join(self.source_folder, identifier + '_dist.b2nd')
-        dist_map = blosc2.open(urlpath=dist_map_file, mode='r', dparams=dparams, mmap_mode='r')
+        try:
+            dist_map = blosc2.open(urlpath=dist_map_file, mode='r', dparams=dparams, mmap_mode='r')
+        except:
+            dist_map = None
 
         properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
         return data, seg, seg_prev, dist_map, properties
