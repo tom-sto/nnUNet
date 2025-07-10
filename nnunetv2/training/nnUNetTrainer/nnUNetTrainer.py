@@ -173,7 +173,6 @@ class nnUNetTrainer(object):
         self.loss = None  # -> self.initialize
         self.weight_bd = 1
         self.cls_loss = None
-        self.cls_loss_weight = 0.1
         self.df_path = rf"{os.environ["MAMAMIA_DATA"]}/clinical_and_imaging_info.xlsx"
         self.pcr_df = None
 
@@ -1052,9 +1051,7 @@ class nnUNetTrainer(object):
             seg_loss = self.loss(seg_out, target, dmap)
 
             cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight \
-                if self.cls_loss is not None \
-                else torch.tensor(0.0, device=self.device)
+            cls_loss = self.cls_loss(cls_out, pcrLabels)
             print("cls_loss:", cls_loss)
             print("Training Loss:", seg_loss)
 
@@ -1063,7 +1060,8 @@ class nnUNetTrainer(object):
                          features=features, 
                          aggregator=self.aggregator,
                          tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
-                         shared_params=list(self.network.encoder.parameters()))
+                         shared_params=list(self.network.encoder.parameters()),
+                         parallel_chunk_size=1)
             self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
@@ -1131,7 +1129,7 @@ class nnUNetTrainer(object):
             del data
             seg_loss = self.loss(output, target, dmap)
             cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels) * self.cls_loss_weight if self.cls_loss is not None else torch.tensor(0)
+            cls_loss = self.cls_loss(cls_out, pcrLabels)
             print("cls_loss:", cls_loss)
 
             percentage_correct: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels
@@ -1494,7 +1492,6 @@ class nnUNetTrainer(object):
         elif self.current_epoch > min(self.num_epochs * 0.5, 1250):     
             self.loss.weight_bd = 100                                 # go to 100 after half of total or 1250 epochs
             self.loss.weight_dice = 1.5                               # also make Dice weight 50% higher 
-            self.cls_loss_weight = 0.2
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
         
