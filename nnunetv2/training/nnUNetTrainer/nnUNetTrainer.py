@@ -1100,17 +1100,29 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            cls_out = self.network(data, metadata)
+            cls_out: torch.Tensor = self.network(data, metadata)
             output = torch.zeros_like(data).to(self.device)
             del data
 
             cls_out = cls_out.squeeze()[labelMask]
+            print("logits range:", cls_out.min(), cls_out.mean(), cls_out.max())
             cls_loss = self.loss(cls_out, pcrLabels)
             print("cls_loss:", cls_loss)
 
-            percentage_correct: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels
-            percentage_correct = percentage_correct.float().mean()
-            print("Percentage correct PCR:", percentage_correct.item())
+            binary_preds: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).bool()
+            pcrLabels = pcrLabels.bool()
+            correct: torch.Tensor = binary_preds == pcrLabels
+            percentage_correct = correct.float().mean()
+            tp_pcr = (binary_preds & pcrLabels).sum()
+            tn_pcr = (~binary_preds & ~pcrLabels).sum()
+            fp_pcr = (binary_preds & ~pcrLabels).sum()
+            fn_pcr = (~binary_preds & pcrLabels).sum()
+            sensitivity = tp_pcr / (tp_pcr + fn_pcr) if (tp_pcr + fn_pcr).item() > 0 else torch.tensor(0.)
+            specificity = tn_pcr / (tn_pcr + fp_pcr) if (tn_pcr + fp_pcr).item() > 0 else torch.tensor(0.)
+            balanced_accuracy = (sensitivity + specificity) / 2
+            self.print_to_log_file(f"Sensitivity: {sensitivity.item()}")
+            self.print_to_log_file(f"Specificity: {specificity.item()}")
+            self.print_to_log_file(f"Balanced Accuracy: {balanced_accuracy.item()}\n")
 
         # we only need the output with the highest output resolution (if DS enabled)
         
@@ -1159,7 +1171,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': cls_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
+        return {'loss': cls_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item(), balanced_accuracy.item()
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
