@@ -672,38 +672,38 @@ class nnUNetTrainer(object):
 
         dataset_tr, dataset_val, tr_keys, val_keys = self.get_tr_and_val_datasets()
 
-        tr_keys = np.array(tr_keys)
-        val_keys = np.array(val_keys)
+        # tr_keys = np.array(tr_keys)
+        # val_keys = np.array(val_keys)
 
-        dist = {"duke": 0.25, "ispy1": 0.15, "ispy2": 0.5, "nact": 0.1}
-        tr_probs = np.zeros_like(tr_keys, dtype=np.float32)
-        for group, prob in dist.items():
-            mask = np.char.find(tr_keys, group) != -1
-            count = np.sum(mask)
-            if count > 0:
-                tr_probs[mask] = prob / count
+        # dist = {"duke": 0.25, "ispy1": 0.15, "ispy2": 0.5, "nact": 0.1}
+        # tr_probs = np.zeros_like(tr_keys, dtype=np.float32)
+        # for group, prob in dist.items():
+        #     mask = np.char.find(tr_keys, group) != -1
+        #     count = np.sum(mask)
+        #     if count > 0:
+        #         tr_probs[mask] = prob / count
 
 
-        val_probs = np.zeros_like(val_keys, dtype=np.float32)
-        for group, prob in dist.items():
-            mask = np.char.find(val_keys, group) != -1
-            count = np.sum(mask)
-            if count > 0:
-                val_probs[mask] = prob / count
+        # val_probs = np.zeros_like(val_keys, dtype=np.float32)
+        # for group, prob in dist.items():
+        #     mask = np.char.find(val_keys, group) != -1
+        #     count = np.sum(mask)
+        #     if count > 0:
+        #         val_probs[mask] = prob / count
 
         dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
                                  initial_patch_size,
                                  self.configuration_manager.patch_size,
                                  self.label_manager,
                                  oversample_foreground_percent=self.oversample_foreground_percent,
-                                 sampling_probabilities=tr_probs, pad_sides=None, transforms=tr_transforms,
+                                 sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
                                  probabilistic_oversampling=self.probabilistic_oversampling)
         dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
                                   self.configuration_manager.patch_size,
                                   self.configuration_manager.patch_size,
                                   self.label_manager,
                                   oversample_foreground_percent=self.oversample_foreground_percent,
-                                  sampling_probabilities=val_probs, pad_sides=None, transforms=val_transforms,
+                                  sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
         allowed_num_processes = get_allowed_n_proc_DA()
@@ -1132,9 +1132,22 @@ class nnUNetTrainer(object):
             cls_loss = self.cls_loss(cls_out, pcrLabels)
             print("cls_loss:", cls_loss)
 
-            percentage_correct: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).to(int) == pcrLabels
-            percentage_correct = percentage_correct.float().mean()
-            print("Percentage correct PCR:", percentage_correct.item())
+            binary_preds: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).bool()
+            pcrLabels = pcrLabels.bool()
+            correct: torch.Tensor = binary_preds == pcrLabels
+            percentage_correct = correct.float().mean()
+            tp_pcr = (binary_preds & pcrLabels).sum()
+            tn_pcr = (~binary_preds & ~pcrLabels).sum()
+            fp_pcr = (binary_preds & ~pcrLabels).sum()
+            fn_pcr = (~binary_preds & pcrLabels).sum()
+            sensitivity = tp_pcr / (tp_pcr + fn_pcr) if (tp_pcr + fn_pcr).item() > 0 else torch.tensor(0.)
+            specificity = tn_pcr / (tn_pcr + fp_pcr) if (tn_pcr + fp_pcr).item() > 0 else torch.tensor(0.)
+            balanced_accuracy = (sensitivity + specificity) / 2
+            self.print_to_log_file(f"Prediction: {binary_preds.int().tolist()}")
+            self.print_to_log_file(f"pcr Labels: {pcrLabels.int().tolist()}")
+            self.print_to_log_file(f"Sensitivity: {sensitivity.item()}")
+            self.print_to_log_file(f"Specificity: {specificity.item()}")
+            self.print_to_log_file(f"Balanced Accuracy: {balanced_accuracy.item()}\n")
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1182,7 +1195,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': seg_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item()
+        return {'loss': seg_loss.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}, cls_loss.item(), percentage_correct.item(), balanced_accuracy.item()
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
