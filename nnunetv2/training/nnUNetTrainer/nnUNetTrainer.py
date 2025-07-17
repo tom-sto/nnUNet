@@ -132,8 +132,8 @@ class nnUNetTrainer(object):
                                        self.__class__.__name__ + '__' + self.plans_manager.plans_name + "__" + configuration) \
             if nnUNet_results is not None else None
         self.output_folder = join(self.output_folder_base, f'fold_{fold}{tag}')      # TODO: Dont forget me!
-        self.metadata_folder = join(nnUNet_preprocessed, '..', 'patient_info_files')
-        assert os.path.exists(self.metadata_folder), f"{self.metadata_folder} does not exist."
+        self.patient_data_folder = join(nnUNet_preprocessed, '..', 'patient_info_files')
+        assert os.path.exists(self.patient_data_folder), f"{self.patient_data_folder} does not exist."
 
         self.preprocessed_dataset_folder = join(self.preprocessed_dataset_folder_base,
                                                 self.configuration_manager.data_identifier)
@@ -1022,7 +1022,7 @@ class nnUNetTrainer(object):
         dmap = batch['dist_map']
         keys = batch['keys']
 
-        metadata = self.get_metadata(keys)
+        patient_data = self.get_patient_data(keys)
         pcrLabels = self.get_pcr(keys, df=self.pcr_df)
 
         # remove -1 labels
@@ -1046,7 +1046,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            features, seg_out, cls_out = self.network(data, metadata)
+            features, seg_out, cls_out = self.network(data, patient_data)
             # del data
             seg_loss = self.loss(seg_out, target, dmap)
 
@@ -1067,7 +1067,11 @@ class nnUNetTrainer(object):
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
-            mtl_backward(losses=[seg_loss, cls_loss], features=features, aggregator=self.aggregator)
+            mtl_backward(losses=[seg_loss, cls_loss], 
+                         features=features, 
+                         aggregator=self.aggregator,
+                         tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
+                         shared_params=list(self.network.encoder.parameters()))
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
 
@@ -1102,7 +1106,7 @@ class nnUNetTrainer(object):
         dmap = batch['dist_map']
         keys = batch['keys']
 
-        metadata = self.get_metadata(keys)
+        patient_data = self.get_patient_data(keys)
         pcrLabels = self.get_pcr(keys, df=self.pcr_df)
 
         # remove -1 labels
@@ -1125,7 +1129,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            _, output, cls_out = self.network(data, metadata)
+            _, output, cls_out = self.network(data, patient_data)
             del data
             seg_loss = self.loss(output, target, dmap)
             cls_out = cls_out.squeeze()[labelMask]
@@ -1143,11 +1147,11 @@ class nnUNetTrainer(object):
             sensitivity = tp_pcr / (tp_pcr + fn_pcr) if (tp_pcr + fn_pcr).item() > 0 else torch.tensor(0.)
             specificity = tn_pcr / (tn_pcr + fp_pcr) if (tn_pcr + fp_pcr).item() > 0 else torch.tensor(0.)
             balanced_accuracy = (sensitivity + specificity) / 2
-            self.print_to_log_file(f"Prediction: {binary_preds.int().tolist()}")
-            self.print_to_log_file(f"pcr Labels: {pcrLabels.int().tolist()}")
-            self.print_to_log_file(f"Sensitivity: {sensitivity.item()}")
-            self.print_to_log_file(f"Specificity: {specificity.item()}")
-            self.print_to_log_file(f"Balanced Accuracy: {balanced_accuracy.item()}\n")
+            # self.print_to_log_file(f"Prediction: {binary_preds.int().tolist()}")
+            # self.print_to_log_file(f"pcr Labels: {pcrLabels.int().tolist()}")
+            # self.print_to_log_file(f"Sensitivity: {sensitivity.item()}")
+            # self.print_to_log_file(f"Specificity: {specificity.item()}")
+            # self.print_to_log_file(f"Balanced Accuracy: {balanced_accuracy.item()}\n")
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1508,17 +1512,17 @@ class nnUNetTrainer(object):
         elif self.current_epoch > min(self.num_epochs * 0.1, 250):      
             self.loss.weight_bd = 10                                  # go to 10 after 10% of total or 250 epochs have passed
         
-    def get_metadata(self, keys: list) -> list:
-        metadata = []
+    def get_patient_data(self, keys: list) -> list:
+        patient_data = []
         for patient_id in keys:
-            json = load_json(join(self.metadata_folder, f"{patient_id}.json"))
+            json = load_json(join(self.patient_data_folder, f"{patient_id}.json"))
             if json is None:
-                raise RuntimeError(f"Metadata for patient {patient_id} not found in {self.metadata_folder}. "
+                raise RuntimeError(f"patient_data for patient {patient_id} not found in {self.patient_data_folder}. "
                                    f"Did you run the preprocessing?")
             useful_json = json["clinical_data"]
 
-            metadata.append(useful_json)
-        return metadata
+            patient_data.append(useful_json)
+        return patient_data
 
     def get_pcr(self, keys: list[str], df: pd.DataFrame) -> torch.Tensor:
         """
