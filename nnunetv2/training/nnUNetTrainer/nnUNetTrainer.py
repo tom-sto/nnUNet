@@ -159,6 +159,7 @@ class nnUNetTrainer(object):
         self.num_epochs = 5000
         self.current_epoch = 0
         self.enable_deep_supervision = True
+        self.pretrainSegmentation = self.num_epochs // 3  # Default value: half of the total epoch count
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -1048,32 +1049,40 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             features, seg_out, cls_out = self.network(data, patient_data)
             # del data
-            seg_loss = self.loss(seg_out, target, dmap)
+            if self.current_epoch < self.pretrainSegmentation:
+                # Pre-training segmentation only
+                seg_loss = self.loss(seg_out, target, dmap)
+                seg_loss.backward()
+                self.optimizer.step()
+                return {'loss': seg_loss.detach().cpu().numpy()}
+            else:
+                # Normal training with segmentation and classification
+                seg_loss = self.loss(seg_out, target, dmap)
 
-            cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels)
-            print("cls_loss:", cls_loss)
-            print("Training Loss:", seg_loss)
+                cls_out = cls_out.squeeze()[labelMask]
+                cls_loss = self.cls_loss(cls_out, pcrLabels)
+                print("cls_loss:", cls_loss)
+                print("Training Loss:", seg_loss)
 
-        if self.grad_scaler is not None:
-            mtl_backward(losses=self.grad_scaler.scale([seg_loss, cls_loss]), 
-                         features=features, 
-                         aggregator=self.aggregator,
-                         tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
-                         shared_params=list(self.network.encoder.parameters()),
-                         parallel_chunk_size=1)
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            mtl_backward(losses=[seg_loss, cls_loss], 
-                         features=features, 
-                         aggregator=self.aggregator,
-                         tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
-                         shared_params=list(self.network.encoder.parameters()))
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                mtl_backward(losses=self.grad_scaler.scale([seg_loss, cls_loss]), 
+                             features=features, 
+                             aggregator=self.aggregator,
+                             tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
+                             shared_params=list(self.network.encoder.parameters()),
+                             parallel_chunk_size=1)
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                mtl_backward(losses=[seg_loss, cls_loss], 
+                             features=features, 
+                             aggregator=self.aggregator,
+                             tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
+                             shared_params=list(self.network.encoder.parameters()))
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.optimizer.step()
 
         return {'loss': seg_loss.detach().cpu().numpy()}
 
