@@ -1049,40 +1049,49 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             features, seg_out, cls_out = self.network(data, patient_data)
             # del data
-            if self.current_epoch < self.pretrainSegmentation:
-                # Pre-training segmentation only
-                seg_loss = self.loss(seg_out, target, dmap)
-                seg_loss.backward()
-                self.optimizer.step()
-                return {'loss': seg_loss.detach().cpu().numpy()}
-            else:
-                # Normal training with segmentation and classification
-                seg_loss = self.loss(seg_out, target, dmap)
-
+            seg_loss: torch.Tensor = self.loss(seg_out, target, dmap)
+            cls_loss = None
+            print("Training Loss:", seg_loss)
+            if self.current_epoch >= self.pretrainSegmentation:
                 cls_out = cls_out.squeeze()[labelMask]
                 cls_loss = self.cls_loss(cls_out, pcrLabels)
                 print("cls_loss:", cls_loss)
-                print("Training Loss:", seg_loss)
+                
 
-            if self.grad_scaler is not None:
-                mtl_backward(losses=self.grad_scaler.scale([seg_loss, cls_loss]), 
-                             features=features, 
-                             aggregator=self.aggregator,
-                             tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
-                             shared_params=list(self.network.encoder.parameters()),
-                             parallel_chunk_size=1)
+        if self.grad_scaler is not None:
+            if self.current_epoch < self.pretrainSegmentation:
+                self.grad_scaler.scale(seg_loss).backward()
                 self.grad_scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
             else:
-                mtl_backward(losses=[seg_loss, cls_loss], 
-                             features=features, 
-                             aggregator=self.aggregator,
-                             tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
-                             shared_params=list(self.network.encoder.parameters()))
+                mtl_backward(losses=self.grad_scaler.scale([seg_loss, cls_loss]), 
+                                features=features, 
+                                aggregator=self.aggregator,
+                                tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
+                                shared_params=list(self.network.encoder.parameters()),
+                                parallel_chunk_size=1)
+                self.grad_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+        else:
+            if self.current_epoch < self.pretrainSegmentation:
+                seg_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
                 self.optimizer.step()
+            else:
+                mtl_backward(losses=[seg_loss, cls_loss], 
+                                features=features, 
+                                aggregator=self.aggregator,
+                                tasks_params=[list(self.network.decoder.parameters()), list(self.network.classifier.parameters())],
+                                shared_params=list(self.network.encoder.parameters()))
+                torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+                self.optimizer.step()
+
+        if cls_loss is not None:
+            seg_loss += cls_loss
 
         return {'loss': seg_loss.detach().cpu().numpy()}
 
@@ -1141,26 +1150,31 @@ class nnUNetTrainer(object):
             _, output, cls_out = self.network(data, patient_data)
             del data
             seg_loss = self.loss(output, target, dmap)
-            cls_out = cls_out.squeeze()[labelMask]
-            cls_loss = self.cls_loss(cls_out, pcrLabels)
-            print("cls_loss:", cls_loss)
+            if self.current_epoch < self.pretrainSegmentation:
+                percentage_correct = torch.tensor(0.)
+                cls_loss = torch.tensor(0.)
+                balanced_accuracy = torch.tensor(0.)
+            else:
+                cls_out = cls_out.squeeze()[labelMask]
+                cls_loss: torch.Tensor = self.cls_loss(cls_out, pcrLabels)
+                print("cls_loss:", cls_loss)
 
-            binary_preds: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).bool()
-            pcrLabels = pcrLabels.bool()
-            correct: torch.Tensor = binary_preds == pcrLabels
-            percentage_correct = correct.float().mean()
-            tp_pcr = (binary_preds & pcrLabels).sum()
-            tn_pcr = (~binary_preds & ~pcrLabels).sum()
-            fp_pcr = (binary_preds & ~pcrLabels).sum()
-            fn_pcr = (~binary_preds & pcrLabels).sum()
-            sensitivity = tp_pcr / (tp_pcr + fn_pcr) if (tp_pcr + fn_pcr).item() > 0 else torch.tensor(0.)
-            specificity = tn_pcr / (tn_pcr + fp_pcr) if (tn_pcr + fp_pcr).item() > 0 else torch.tensor(0.)
-            balanced_accuracy = (sensitivity + specificity) / 2
-            # self.print_to_log_file(f"Prediction: {binary_preds.int().tolist()}")
-            # self.print_to_log_file(f"pcr Labels: {pcrLabels.int().tolist()}")
-            # self.print_to_log_file(f"Sensitivity: {sensitivity.item()}")
-            # self.print_to_log_file(f"Specificity: {specificity.item()}")
-            # self.print_to_log_file(f"Balanced Accuracy: {balanced_accuracy.item()}\n")
+                binary_preds: torch.Tensor = (torch.sigmoid(cls_out) > 0.5).bool()
+                pcrLabels = pcrLabels.bool()
+                correct: torch.Tensor = binary_preds == pcrLabels
+                percentage_correct = correct.float().mean()
+                tp_pcr = (binary_preds & pcrLabels).sum()
+                tn_pcr = (~binary_preds & ~pcrLabels).sum()
+                fp_pcr = (binary_preds & ~pcrLabels).sum()
+                fn_pcr = (~binary_preds & pcrLabels).sum()
+                sensitivity = tp_pcr / (tp_pcr + fn_pcr) if (tp_pcr + fn_pcr).item() > 0 else torch.tensor(0.)
+                specificity = tn_pcr / (tn_pcr + fp_pcr) if (tn_pcr + fp_pcr).item() > 0 else torch.tensor(0.)
+                balanced_accuracy = (sensitivity + specificity) / 2
+                # self.print_to_log_file(f"Prediction: {binary_preds.int().tolist()}")
+                # self.print_to_log_file(f"pcr Labels: {pcrLabels.int().tolist()}")
+                # self.print_to_log_file(f"Sensitivity: {sensitivity.item()}")
+                # self.print_to_log_file(f"Specificity: {specificity.item()}")
+                # self.print_to_log_file(f"Balanced Accuracy: {balanced_accuracy.item()}\n")
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
